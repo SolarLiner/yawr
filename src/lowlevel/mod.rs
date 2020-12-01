@@ -1,8 +1,13 @@
-pub mod reader;
+use std::io::{Read, Write};
 
-use std::io::Read;
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+
 use reader::{ReadError, SampleIteratorFormat};
+use std::any::TypeId;
+use crate::WavFileDesc;
+
+pub mod reader;
+pub mod writer;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum AudioFormat {
@@ -19,19 +24,51 @@ impl AudioFormat {
             x => Self::Unknown(x),
         }
     }
+
+    pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), writer::WriteError> {
+        writer.write_u16::<LittleEndian>(match self {
+            Self::PCMLinear => 1,
+            Self::PCMFloat => 3,
+            &Self::Unknown(x) => x,
+        })?;
+        Ok(())
+    }
+}
+
+macro_rules! type_eq {
+    ($t1:ty, $t2:ty) => {TypeId::of::<$t1>() == TypeId::of::<$t2>()};
+}
+
+impl AudioFormat {
+    pub(crate) fn from_type<T: 'static>() -> Self {
+        if type_eq!(T, f32) || type_eq!(T, f64) {
+            Self::PCMFloat
+        } else if type_eq!(T, u8) || type_eq!(T, i16) || type_eq!(T, i32) || type_eq!(T, i64) {
+            Self::PCMLinear
+        } else {
+            Self::Unknown(0)
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct WavHeader {
+    /// File size in bytes, minus 8 byutes
     pub file_size: u32,
-    pub block_size: u32,
+    /// Audio format.
     pub audio_format: AudioFormat,
+    /// Number of channels
     pub channels: u16,
+    /// Sample rate
     pub sample_rate: u32,
+    /// Data throughput for real-time playback (byte/s)
     pub bytes_per_sec: u32,
+    /// Block size in bytes
     pub bytes_per_block: u16,
+    /// Bitsize of the sample type
     pub bits_per_sample: u16,
-    data_size: u32,
+    /// Data block size (bytes)
+    pub data_size: u32,
 }
 
 macro_rules! expect_magic {
@@ -53,7 +90,7 @@ impl WavHeader {
         expect_magic!(read reader, b"WAVE", ReadError::ExpectedWAVE);
         expect_magic!(read reader, b"fmt ", ReadError::ExpectedFmt);
 
-        let block_size = reader.read_u32::<LittleEndian>()?;
+        let _ = reader.read_u32::<LittleEndian>()?; // Discard the subckunk size
         let audio_format = AudioFormat::from_u16(reader.read_u16::<LittleEndian>()?);
         let channels = reader.read_u16::<LittleEndian>()?;
         let sample_rate = reader.read_u32::<LittleEndian>()?;
@@ -66,7 +103,6 @@ impl WavHeader {
 
         Ok((Self {
             file_size,
-            block_size,
             audio_format,
             channels,
             sample_rate,
@@ -75,6 +111,23 @@ impl WavHeader {
             bits_per_sample,
             data_size,
         }, reader))
+    }
+
+    /// /!\ Does not write the data size (unknown for the header)
+    pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), writer::WriteError> {
+        writer.write(b"RIFF")?;
+        writer.write_u32::<LittleEndian>(self.file_size)?;
+        writer.write(b"WAVEfmt ")?;
+        writer.write_u32::<LittleEndian>(16)?;
+        self.audio_format.write(writer)?;
+        writer.write_u16::<LittleEndian>(self.channels)?;
+        writer.write_u32::<LittleEndian>(self.sample_rate)?;
+        writer.write_u32::<LittleEndian>(self.bytes_per_sec)?;
+        writer.write_u16::<LittleEndian>(self.bytes_per_block)?;
+        writer.write_u16::<LittleEndian>(self.bits_per_sample)?;
+
+        writer.write(b"data")?;
+        Ok(())
     }
 }
 
@@ -94,7 +147,7 @@ impl<R: Read> WavFile<R> {
     }
 
     pub fn len(&self) -> usize {
-        (self.header.data_size * 8 / self.header.block_size) as usize
+        (self.header.data_size * 8 / self.header.data_size) as usize
     }
 
     pub fn samples(self) -> Result<SampleIteratorFormat<R>, ()> {
@@ -120,15 +173,23 @@ impl<R: Read> WavFile<R> {
     }
 }
 
+impl<W: Write> WavFile<W> {
+    pub fn write<T: 'static>(desc: WavFileDesc<T>, writer: W) -> Self {
+        Self {
+            header: desc.into(),
+            data: writer,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
     use std::path::Path;
 
-    use crate::sample::NumIO;
     use crate::lowlevel::{AudioFormat, WavHeader};
-
-    const DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test_data");
+    use crate::sample::NumIO;
+    use crate::DATA_DIR;
 
     #[test]
     fn test_header_well_formed() {
@@ -145,7 +206,6 @@ mod tests {
         assert_eq!(header.sample_rate, 44100);
         assert_eq!(header.bits_per_sample, 16);
         assert_eq!(header.bytes_per_block, 2);
-        assert_eq!(header.block_size, 16);
     }
 
     #[test]

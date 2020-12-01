@@ -1,7 +1,8 @@
-use crate::lowlevel::WavFile;
-use std::marker::PhantomData;
-use crate::sample::NumIO;
 use std::io::Read;
+use std::marker::PhantomData;
+
+use crate::lowlevel::WavFile;
+use crate::sample::NumIO;
 
 #[derive(Error, Debug)]
 pub enum ReadError {
